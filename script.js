@@ -41,13 +41,9 @@ if (searchForm) {
 
             const result = await response.json();
 
-            if (response.ok) {
-
-                alert(result.message);
-
-                window.location.href = "/results.html";
-
-            } else {
+        if (response.ok) {
+    window.location.href = "/results.html";
+} else {
 
                 alert(result.message);
 

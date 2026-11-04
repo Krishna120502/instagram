@@ -1,31 +1,63 @@
 
 from flask import Flask, request, jsonify, send_from_directory
-from openpyxl import Workbook, load_workbook
-from datetime import datetime
 import os
-import os
-import traceback
+import psycopg
 
 app = Flask(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-EXCEL_FILE = os.path.join(BASE_DIR, "submissions.xlsx")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
-def create_excel():
-    if not os.path.exists(EXCEL_FILE):
-        workbook = Workbook()
-        sheet = workbook.active
-        sheet.title = "Records"
+def get_connection():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured.")
+    return psycopg.connect(DATABASE_URL)
 
-        sheet.append([
-            "Submission Time",
-            "Demo Identifier",
-            "Your Name"
-        ])
 
-        workbook.save(EXCEL_FILE)
-        workbook.close()
+def create_table():
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS demo_submissions (
+                    id BIGSERIAL PRIMARY KEY,
+                    submitted_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    demo_identifier VARCHAR(60) NOT NULL,
+                    demo_name VARCHAR(60) NOT NULL
+                )
+            """)
+
+            # Rename the old columns if the previous table already exists.
+            cursor.execute("""
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'demo_submissions'
+                        AND column_name = 'demo_code'
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'demo_submissions'
+                        AND column_name = 'demo_identifier'
+                    ) THEN
+                        ALTER TABLE demo_submissions
+                        RENAME COLUMN demo_code TO demo_identifier;
+                    END IF;
+
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'demo_submissions'
+                        AND column_name = 'demo_label'
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'demo_submissions'
+                        AND column_name = 'demo_name'
+                    ) THEN
+                        ALTER TABLE demo_submissions
+                        RENAME COLUMN demo_label TO demo_name;
+                    END IF;
+                END $$;
+            """)
 
 
 @app.route("/")
@@ -51,66 +83,56 @@ def results():
 @app.route("/assets/<path:filename>")
 def assets(filename):
     return send_from_directory(
-        os.path.join(BASE_DIR, "assets"),
-        filename
+        os.path.join(BASE_DIR, "assets"), filename
     )
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
 
 
 @app.route("/submit", methods=["POST"])
 def submit():
-
     data = request.get_json(silent=True) or {}
 
-    print("Received demo data:", data)
+    # Accept only invented demo values, never passwords or real personal data.
+    demo_identifier = data.get("identifier")
+    demo_name = data.get("your_name")
 
-    identifier = data.get("identifier", "").strip()
-    your_name = data.get("your_name", "").strip()
+    if not isinstance(demo_identifier, str) or not isinstance(demo_name, str):
+        return jsonify({"message": "Please enter both demo values."}), 400
 
-    if not identifier or not your_name:
-        return jsonify({
-            "message": "Please fill in all fields."
-        }), 400
+    demo_identifier = demo_identifier.strip()
+    demo_name = demo_name.strip()
+
+    if not demo_identifier or not demo_name:
+        return jsonify({"message": "Please enter both demo values."}), 400
+
+    if len(demo_identifier) > 60 or len(demo_name) > 60:
+        return jsonify({"message": "Each value must be 60 characters or fewer."}), 400
 
     try:
-        create_excel()
+        create_table()
 
-        workbook = load_workbook(EXCEL_FILE)
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO demo_submissions
+                    (demo_identifier, demo_name)
+                    VALUES (%s, %s)
+                    """,
+                    (demo_identifier, demo_name)
+                )
 
-        try:
-            sheet = workbook["Records"]
-
-            sheet.append([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                identifier,
-                your_name
-            ])
-
-            workbook.save(EXCEL_FILE)
-
-        finally:
-            workbook.close()
-
-        print("Demo data saved successfully!")
-        print("Excel location:", EXCEL_FILE)
-
-        return jsonify({
-            "message": "Demo submission saved successfully!"
-        }), 200
+        return jsonify({"message": "Demo data saved successfully!"}), 200
 
     except Exception:
-        print("========== EXCEL ERROR ==========")
-        traceback.print_exc()
-        print("=================================")
-
-        return jsonify({
-            "message": "Unable to save demo submission. Check the terminal."
-        }), 500
+        app.logger.exception("Database submission failed")
+        return jsonify({"message": "Unable to save demo data."}), 500
 
 
 if __name__ == "__main__":
-    create_excel()
-
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
